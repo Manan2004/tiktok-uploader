@@ -238,22 +238,29 @@ def build_description(shazam_result: dict | None) -> str:
 # ---------------------------------------------------------------------------
 # Phase 1 (async): recognise all songs, return jobs list
 # ---------------------------------------------------------------------------
-async def recognise_all(videos: list[Path]) -> list[tuple[Path, str]]:
-    """Return list of (video_path, description) for every video."""
-    jobs: list[tuple[Path, str]] = []
+async def recognise_all(videos: list[Path]) -> list[tuple[Path, str, str | None]]:
+    """Return list of (video_path, description, sound_query) for every video."""
+    jobs: list[tuple[Path, str, str | None]] = []
     for video in videos:
         logger.info("")
         logger.info("━" * 55)
         logger.info("Recognising: %s", video.name)
         result = await recognize_song(video)
+        sound: str | None = None
         if result and "track" in result:
             track = result["track"]
-            logger.info(
-                "  ✓ Song: %s — %s", track.get("title", "?"), track.get("subtitle", "?")
-            )
+            title = track.get("title", "").strip()
+            artist = track.get("subtitle", "").strip()
+            logger.info("  ✓ Song: %s — %s", title, artist)
+            if title or artist:
+                # Use only the first credited artist for the search query
+                first_artist = re.split(
+                    r"\s*(?:&|,|ft\.|feat\.)\s*", artist, maxsplit=1
+                )[0].strip()
+                sound = f"{title} {first_artist}".strip()
         else:
             logger.info("  ✗ No song recognised → using default tags")
-        jobs.append((video, build_description(result)))
+        jobs.append((video, build_description(result), sound))
     return jobs
 
 
@@ -261,16 +268,17 @@ async def recognise_all(videos: list[Path]) -> list[tuple[Path, str]]:
 # Phase 2 (sync): upload with schedule — must run outside asyncio loop
 # ---------------------------------------------------------------------------
 def upload_all(
-    jobs: list[tuple[Path, str]], slots: list[datetime], state: dict
+    jobs: list[tuple[Path, str, str | None]], slots: list[datetime], state: dict
 ) -> None:
     uploader = TikTokUploader(cookies=str(COOKIES_FILE), headless=True)
     failed: list[str] = []
 
-    for (video, description), slot in zip(jobs, slots):
+    for (video, description, sound), slot in zip(jobs, slots):
         logger.info("")
         logger.info("━" * 55)
         logger.info("Uploading : %s", video.name)
         logger.info("  Description : %s", description)
+        logger.info("  Sound       : %s", sound or "(none)")
         logger.info("  Scheduled at: %s", slot.strftime("%Y-%m-%d %H:%M %Z"))
 
         # Pass as naive local datetime — upload.py treats naive as local and converts to UTC correctly.
@@ -279,7 +287,7 @@ def upload_all(
 
         try:
             uploader.upload_video(
-                str(video), description=description, schedule=slot_naive
+                str(video), description=description, schedule=slot_naive, sound=sound
             )
             logger.info("  ✓ Scheduled successfully")
             state["uploaded"].append(video.name)

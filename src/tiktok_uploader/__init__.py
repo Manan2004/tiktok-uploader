@@ -14,14 +14,13 @@ config = load_config(join(config_dir, "config.toml"))
 ## Setup Logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
+# No custom handler — let records propagate to the root logger
+# so callers can configure formatting and filtering in one place.
 
-formatter = logging.Formatter("%(asctime)s %(message)s", datefmt="[%H:%M:%S]")
-
-stream_handler = logging.StreamHandler()
-stream_handler.setLevel(logging.DEBUG)
-stream_handler.setFormatter(formatter)
-logger.addHandler(stream_handler)
-
-from tiktok_uploader.upload import TikTokUploader, upload_video, upload_videos  # noqa: E402, I001
+from tiktok_uploader.upload import (
+    TikTokUploader,
+    upload_video,
+    upload_videos,
+)  # noqa: E402, I001
 
 __all__ = ["TikTokUploader", "upload_video", "upload_videos"]

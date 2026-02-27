@@ -93,6 +93,7 @@ class TikTokUploader:
         visibility: Literal["everyone", "friends", "only_you"] = "everyone",
         num_retries: int = 1,
         skip_split_window: bool = False,
+        sound: str | None = None,
         *args,
         **kwargs,
     ) -> bool:
@@ -112,6 +113,8 @@ class TikTokUploader:
             video_dict["visibility"] = visibility
         if cover:
             video_dict["cover"] = cover
+        if sound:
+            video_dict["sound"] = sound
 
         failed_list = self.upload_videos(
             [video_dict], num_retries, skip_split_window, *args, **kwargs
@@ -148,6 +151,7 @@ class TikTokUploader:
                 schedule = video.get("schedule", None)
                 product_id = video.get("product_id", None)
                 cover_path = video.get("cover", None)
+                sound = video.get("sound", None)
                 if cover_path is not None:
                     cover_path = abspath(cover_path)
 
@@ -207,6 +211,7 @@ class TikTokUploader:
                     visibility,
                     num_retries,
                     self.headless,
+                    sound=sound,
                     *args,
                     **kwargs,
                 )  # type: ignore[misc]
@@ -353,6 +358,7 @@ def complete_upload_form(
     visibility: Literal["everyone", "friends", "only_you"] = "everyone",
     num_retries: int = 1,
     headless: bool = False,
+    sound: str | None = None,
     *args,
     **kwargs,
 ) -> None:
@@ -366,6 +372,8 @@ def complete_upload_form(
     _set_video(page, path=path, num_retries=num_retries, **kwargs)
     _dismiss_feature_popup(page)  # may appear again after video processes
 
+    if sound:
+        _set_sound(page, sound)
     if cover_path:
         _set_cover(page, cover_path)
     if not skip_split_window:
@@ -540,6 +548,199 @@ def _dismiss_feature_popup(page: Page) -> None:
             logger.debug(green("Dismissed feature popup"))
     except Exception:
         pass
+
+
+def _set_sound(page: Page, sound: str) -> None:
+    """
+    Adds a sound to the video via the TikTok Studio editor panel.
+    Flow:
+      1. Click 'Sounds' button in the editor toolbar
+      2. Search for the song
+      3. Click '+' on the first result → song added to timeline
+      4. Mute the song audio track (second row in timeline)
+      5. Click 'Save'
+    Non-fatal — logs a warning on any failure.
+    """
+    logger.debug(green(f"Adding sound: {sound}"))
+    try:
+        # ── Step 1: Click 'Sounds' in the editor toolbar ──────────────────
+        sounds_btn = None
+        for sel in [
+            "xpath=//button[normalize-space()='Sounds']",
+            "xpath=//button[.//span[normalize-space()='Sounds']]",
+            "xpath=//div[@role='button' and normalize-space()='Sounds']",
+            "xpath=//*[normalize-space()='Sounds' and (self::button or @role='button')]",
+            "xpath=//span[normalize-space()='Sounds']/ancestor::button[1]",
+            "xpath=//span[normalize-space()='Sounds']/ancestor::div[@role='button'][1]",
+        ]:
+            try:
+                el = page.locator(sel).first
+                if el.is_visible(timeout=3000):
+                    sounds_btn = el
+                    break
+            except Exception:
+                continue
+
+        if sounds_btn is None:
+            logger.warning("Sounds button not found — skipping sound")
+            return
+
+        sounds_btn.click()
+        time.sleep(1.5)
+
+        # ── Step 2: Search for the song ────────────────────────────────────
+        search_box = None
+        for sel in [
+            "xpath=//input[contains(@placeholder,'Search sounds') or contains(@placeholder,'search sounds')]",
+            "xpath=//input[contains(@placeholder,'Search') and ancestor::*[contains(@class,'sound') or contains(@class,'Sound')]]",
+        ]:
+            try:
+                el = page.locator(sel).first
+                if el.is_visible(timeout=6000):
+                    search_box = el
+                    break
+            except Exception:
+                continue
+
+        if search_box is None:
+            logger.warning("Sound search box not found — skipping sound")
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+            return
+
+        search_box.click()
+        search_box.fill(sound)
+        time.sleep(0.5)
+        page.keyboard.press("Enter")
+        time.sleep(3)  # wait for results to load
+
+        # ── Step 3: Click '+' on the first search result ───────────────────
+        # Wait a bit longer to ensure results have fully rendered
+        time.sleep(2)
+
+        add_btn = None
+        for sel in [
+            # Explicit aria-label Add button
+            "xpath=(//button[@aria-label='Add' or @aria-label='add'])[1]",
+            # Button containing only a '+' character
+            "xpath=(//button[normalize-space(.)='+'])[1]",
+            # Button with title 'Add'
+            "xpath=(//button[@title='Add' or @title='add'])[1]",
+            # Any list item's last button (the + circle at right of row)
+            "xpath=(//li[.//button])[1]//button[last()]",
+            # Any div-row's last button
+            "xpath=(//div[@role='listitem' or @role='option'][.//button])[1]//button[last()]",
+            # SVG button that is NOT the search/clear/close/back button
+            "xpath=(//button[.//svg][not(contains(@class,'close'))][not(contains(@class,'clear'))][not(contains(@class,'back'))][not(contains(@class,'search'))])[last()]",
+        ]:
+            try:
+                el = page.locator(sel).first
+                if el.is_visible(timeout=2000):
+                    add_btn = el
+                    break
+            except Exception:
+                continue
+
+        if add_btn is None:
+            logger.warning(f"No sound results found for '{sound}' — skipping")
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+            return
+
+        add_btn.click()
+        time.sleep(1.5)
+
+        # ── Step 4: Close the Sounds panel ────────────────────────────────
+        # Clicking + does NOT always close the panel. Close it explicitly so
+        # the panel buttons don't interfere with the speaker button search.
+        try:
+            # The panel header has an × button; try several selectors.
+            closed = False
+            for close_sel in [
+                "xpath=//div[contains(@class,'SoundPanel') or contains(@class,'Sounds')]//button[@aria-label='Close' or @aria-label='close' or @title='Close']",
+                "xpath=//div[contains(text(),'Sounds')]/following-sibling::button",
+                "xpath=//div[@class[contains(.,'sound') or contains(.,'Sound')]]//button[.//svg][1]",
+            ]:
+                try:
+                    el = page.locator(close_sel).first
+                    if el.is_visible(timeout=1000):
+                        el.click()
+                        closed = True
+                        break
+                except Exception:
+                    continue
+            if not closed:
+                page.keyboard.press("Escape")
+            time.sleep(1)
+        except Exception:
+            pass
+
+        # ── Step 5: Click song track → set volume to -60 dB (silent) ─────────
+        try:
+            # Click the audio track bar to select it and open the Audio panel.
+            sound_word = (sound or "").split()[0]
+            selected = False
+            for sel in [
+                f"xpath=(//div[contains(@class,'track') or contains(@class,'Track') or contains(@class,'audio') or contains(@class,'Audio')][.//*[contains(text(),'{sound_word}')]])[1]",
+                f"xpath=(//*[contains(text(),'{sound_word}') and not(ancestor::*[contains(@class,'SoundPanel') or contains(@class,'search') or contains(@class,'list')])])[last()]",
+            ]:
+                try:
+                    el = page.locator(sel).first
+                    if el.is_visible(timeout=1500):
+                        el.dispatch_event("click")
+                        selected = True
+                        break
+                except Exception:
+                    continue
+            if not selected:
+                vp = page.viewport_size or {"width": 1280, "height": 720}
+                page.mouse.click(int(vp["width"] * 0.5), int(vp["height"] * 0.91))
+            time.sleep(1.5)
+
+            # The Volume input has class PropSettingInput__input; the topmost
+            # visible one (lowest y) is Volume, the others are Fade in/out.
+            vol_input = page.locator("input.PropSettingInput__input").first
+            vol_input.wait_for(state="visible", timeout=5000)
+            vol_input.click()
+            page.keyboard.press("ControlOrMeta+A")
+            page.keyboard.type("-60")
+            page.keyboard.press("Enter")
+            time.sleep(0.4)
+            logger.debug(green("Song track volume set to -60 dB (silent)"))
+        except Exception as mute_exc:
+            logger.warning(f"Could not silence song track: {mute_exc}")
+
+        # ── Step 5: Click Save ─────────────────────────────────────────────
+        # Save exits the editor and returns to the main upload form.
+        save_btn = None
+        for sel in [
+            "xpath=//button[normalize-space()='Save']",
+            "xpath=//button[.//span[normalize-space()='Save']]",
+        ]:
+            try:
+                el = page.locator(sel).first
+                if el.is_visible(timeout=5000):
+                    save_btn = el
+                    break
+            except Exception:
+                continue
+
+        if save_btn is None:
+            logger.warning("Save button not found — sound added but not saved")
+            return
+
+        save_btn.click()
+        time.sleep(2)
+
+        logger.debug(green(f"Sound set and saved: {sound}"))
+    except Exception as exc:
+        logger.warning(
+            f"Failed to add sound '{sound}': {exc} — continuing without sound"
+        )
 
 
 def _remove_cookies_window(page: Page) -> None:

@@ -103,7 +103,6 @@ class AuthBackend:
             #     c["domain"] = c["domain"][1:]
 
             # logger.debug(f"Adding cookie: {c}")
-            print(f"DEBUG: Adding cookie: {c}")
             playwright_cookies.append(c)
 
         try:
@@ -111,7 +110,7 @@ class AuthBackend:
                 try:
                     page.context.add_cookies([cast(Any, pc)])
                 except Exception as e:
-                    print(f"DEBUG: Failed to add individual cookie {pc['name']}: {e}")
+                    logger.debug(f"Failed to add individual cookie {pc['name']}: {e}")
         except Exception as e:
             logger.error(f"Failed to add cookies: {e}")
 
