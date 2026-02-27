@@ -308,8 +308,9 @@ def upload_videos(
     sessionid: str | None = None,
     proxy: ProxyDict | None = None,
     browser: Literal["chrome", "safari", "chromium", "edge", "firefox"] = "chrome",
-    browser_agent: Page
-    | None = None,  # Not fully supported in new class-based approach as constructor
+    browser_agent: (
+        Page | None
+    ) = None,  # Not fully supported in new class-based approach as constructor
     headless: bool = False,
     *args,
     **kwargs,
@@ -360,8 +361,10 @@ def complete_upload_form(
     """
     _go_to_upload(page)
     _remove_cookies_window(page)
+    _dismiss_feature_popup(page)
 
     _set_video(page, path=path, num_retries=num_retries, **kwargs)
+    _dismiss_feature_popup(page)  # may appear again after video processes
 
     if cover_path:
         _set_cover(page, cover_path)
@@ -415,7 +418,11 @@ def _set_description(page: Page, description: str) -> None:
 
         desc_locator.click()
 
-        # Clear existing text
+        # Select all existing text and delete it.
+        # On macOS, Ctrl+A moves cursor to line start; Meta+A (Cmd+A) selects all.
+        desc_locator.press("Meta+A")
+        desc_locator.press("Backspace")
+        # Belt-and-suspenders: repeat with Ctrl+A for Linux/Windows compatibility
         desc_locator.press("Control+A")
         desc_locator.press("Backspace")
 
@@ -516,6 +523,25 @@ def _set_video(page: Page, path: str = "", num_retries: int = 3, **kwargs) -> No
             raise FailedToUpload(exception)
 
 
+def _dismiss_feature_popup(page: Page) -> None:
+    """
+    Dismisses TikTok's 'New editing features added' (or similar) modal
+    by clicking any 'Got it' / 'OK' / 'Close' button that appears.
+    """
+    try:
+        # Match button by visible text — covers 'Got it', 'Got It', etc.
+        btn = page.locator(
+            "//button[contains(translate(., 'GOTIQUK', 'gotiquk'), 'got it')]"
+            " | //button[contains(translate(., 'GOTIQUK', 'gotiquk'), 'ok')]"
+            " | //div[contains(@class,'modal')]//button"
+        ).first
+        if btn.is_visible(timeout=4000):
+            btn.click()
+            logger.debug(green("Dismissed feature popup"))
+    except Exception:
+        pass
+
+
 def _remove_cookies_window(page: Page) -> None:
     """
     Removes the cookies window if it is open
@@ -530,10 +556,12 @@ def _remove_cookies_window(page: Page) -> None:
             button.click()
 
     except Exception:
-        page.evaluate(f"""
+        page.evaluate(
+            f"""
             const banner = document.querySelector("{config.selectors.upload.cookies_banner.banner}");
             if (banner) banner.remove();
-        """)
+        """
+        )
 
 
 def _remove_split_window(page: Page) -> None:
@@ -635,8 +663,79 @@ def _set_schedule_video(page: Page, schedule: datetime.datetime) -> None:
     minute = schedule.minute
 
     try:
-        switch = page.locator(f"xpath={config.selectors.schedule.switch}")
-        switch.click()
+        # TikTok shows a "When to post" section with "Now" and "Schedule" radio buttons.
+        # The radio <input> is visually hidden; we must click the visible label/span.
+        clicked = False
+        label_selectors = [
+            "label:has-text('Schedule')",
+            "xpath=//label[contains(normalize-space(.), 'Schedule')]",
+            "xpath=//span[normalize-space(text())='Schedule']",
+            "xpath=//div[normalize-space(text())='Schedule']",
+        ]
+        for sel in label_selectors:
+            try:
+                el = page.locator(sel).first
+                if el.is_visible(timeout=3000):
+                    el.click()
+                    clicked = True
+                    logger.debug(green("Clicked Schedule label"))
+                    break
+            except Exception:
+                continue
+
+        if not clicked:
+            # Fallback: force-click the hidden radio input
+            for sel in [
+                "xpath=//input[@type='radio'][2]",
+                "xpath=//label[contains(.,'Schedule')]/input",
+                "xpath=//*[@id='tux-1']",
+            ]:
+                try:
+                    page.locator(sel).first.click(force=True)
+                    clicked = True
+                    logger.debug(green("Force-clicked Schedule radio input"))
+                    break
+                except Exception:
+                    continue
+
+        if not clicked:
+            raise Exception("Could not find or click Schedule toggle")
+
+        time.sleep(1)  # wait for date/time pickers OR low-quality popup to appear
+
+        # TikTok sometimes shows a "low quality" warning when Schedule is clicked.
+        # Close it with X (do NOT click "Replace Video"), then re-click Schedule.
+        low_quality_dismissed = False
+        try:
+            close_btn = page.locator(
+                "xpath=//div[contains(@class,'modal') or contains(@class,'dialog') or contains(@class,'popup')]"
+                "//button[@aria-label='Close' or contains(@class,'close') or contains(@class,'dismiss')]"
+                " | xpath=//*[@data-e2e='close-btn']"
+                " | xpath=//button[contains(@aria-label,'lose')]"
+            ).first
+            if close_btn.is_visible(timeout=2000):
+                close_btn.click()
+                low_quality_dismissed = True
+                logger.debug(green("Dismissed low-quality warning popup"))
+                time.sleep(0.5)
+        except Exception:
+            pass
+
+        # If we dismissed a popup, the Schedule radio may have been de-selected — re-click it.
+        if low_quality_dismissed:
+            for sel in label_selectors:
+                try:
+                    el = page.locator(sel).first
+                    if el.is_visible(timeout=3000):
+                        el.click()
+                        logger.debug(
+                            green("Re-clicked Schedule label after popup dismissal")
+                        )
+                        time.sleep(1)
+                        break
+                except Exception:
+                    continue
+
         __date_picker(page, month, day)
         __time_picker(page, hour, minute)
     except Exception as e:
@@ -648,16 +747,46 @@ def _set_schedule_video(page: Page, schedule: datetime.datetime) -> None:
 def __date_picker(page: Page, month: int, day: int) -> None:
     logger.debug(green("Picking date"))
 
-    date_picker = page.locator(f"xpath={config.selectors.schedule.date_picker}")
-    date_picker.click()
+    # The date input is inside div.scheduled-picker and has a value like "2026-02-26"
+    date_input = page.locator(
+        "xpath=//div[contains(@class,'scheduled-picker')]//input[contains(@value,'-')]"
+    ).first
+    date_input.wait_for(state="visible", timeout=5000)
+    date_input.click()
+    time.sleep(0.5)
 
-    calendar = page.locator(f"xpath={config.selectors.schedule.calendar}")
-    calendar.wait_for(state="visible")
+    # Wait for the calendar to be injected into the DOM
+    calendar = None
+    for sel in [
+        "xpath=//div[contains(@class,'calendar-wrapper')]",
+        "xpath=//div[contains(@class,'calendar')]",
+    ]:
+        try:
+            el = page.locator(sel).first
+            el.wait_for(state="visible", timeout=5000)
+            calendar = el
+            break
+        except Exception:
+            continue
 
-    calendar_month = page.locator(
-        f"xpath={config.selectors.schedule.calendar_month}"
-    ).inner_text()
-    n_calendar_month = datetime.datetime.strptime(calendar_month, "%B").month
+    if calendar is None:
+        raise Exception("Calendar not found after clicking date input")
+
+    # Read current month from calendar header (e.g. "February / 2026" or "February")
+    n_calendar_month = month  # fallback: assume already correct
+    for sel in [
+        "xpath=//span[contains(@class,'month-title')]",
+        "xpath=//div[contains(@class,'month-title')]",
+    ]:
+        try:
+            el = page.locator(sel).first
+            if el.is_visible(timeout=2000):
+                text = el.inner_text().strip()
+                month_part = text.split("/")[0].split()[0].strip()
+                n_calendar_month = datetime.datetime.strptime(month_part, "%B").month
+                break
+        except Exception:
+            continue
 
     if n_calendar_month != month:
         arrows = page.locator(f"xpath={config.selectors.schedule.calendar_arrows}")
@@ -665,35 +794,58 @@ def __date_picker(page: Page, month: int, day: int) -> None:
             arrows.last.click()
         else:
             arrows.first.click()
+        time.sleep(0.5)
 
-    valid_days = page.locator(
-        f"xpath={config.selectors.schedule.calendar_valid_days}"
-    ).all()
+    # Click the matching day cell
+    day_selectors = [
+        "xpath=//div[contains(@class,'days-wrapper')]//span[contains(@class,'day') and contains(@class,'valid')]",
+        "xpath=//span[contains(@class,'day') and contains(@class,'valid')]",
+        "xpath=//div[contains(@class,'days-wrapper')]//span[contains(@class,'day')]",
+    ]
+    valid_days = []
+    for sel in day_selectors:
+        try:
+            candidates = page.locator(sel).all()
+            if candidates:
+                valid_days = candidates
+                break
+        except Exception:
+            continue
 
     day_to_click = None
     for day_option in valid_days:
-        if int(day_option.inner_text()) == day:
-            day_to_click = day_option
-            break
+        try:
+            if int(day_option.inner_text().strip()) == day:
+                day_to_click = day_option
+                break
+        except Exception:
+            continue
+
     if day_to_click:
         day_to_click.click()
     else:
-        raise Exception("Day not found in calendar")
+        raise Exception(f"Day {day} not found in calendar")
 
     __verify_date_picked_is_correct(page, month, day)
 
 
 def __verify_date_picked_is_correct(page: Page, month: int, day: int) -> None:
-    date_selected = page.locator(
-        f"xpath={config.selectors.schedule.date_picker}"
-    ).inner_text()
-    date_selected_month = int(date_selected.split("-")[1])
-    date_selected_day = int(date_selected.split("-")[2])
+    # Read back the date input value (format: YYYY-MM-DD)
+    date_input = page.locator(
+        "xpath=//div[contains(@class,'scheduled-picker')]//input[contains(@value,'-')]"
+    ).first
+    date_selected = date_input.get_attribute("value") or ""
+    try:
+        date_selected_month = int(date_selected.split("-")[1])
+        date_selected_day = int(date_selected.split("-")[2])
+    except Exception:
+        logger.debug(green(f"Could not verify date — raw value: {date_selected!r}"))
+        return
 
     if date_selected_month == month and date_selected_day == day:
         logger.debug(green("Date picked correctly"))
     else:
-        msg = f"Something went wrong with the date picker, expected {month}-{day} but got {date_selected_month}-{date_selected_day}"
+        msg = f"Date picker mismatch: expected {month}-{day} but got {date_selected_month}-{date_selected_day}"
         logger.error(msg)
         raise Exception(msg)
 
@@ -701,31 +853,48 @@ def __verify_date_picked_is_correct(page: Page, month: int, day: int) -> None:
 def __time_picker(page: Page, hour: int, minute: int) -> None:
     logger.debug(green("Picking time"))
 
-    time_picker = page.locator(f"xpath={config.selectors.schedule.time_picker}")
+    # The time input is inside div.scheduled-picker — value like "22:30" (no dash)
+    time_picker = page.locator(
+        "xpath=//div[contains(@class,'scheduled-picker')]//input[not(contains(@value,'-'))]"
+    ).first
+    if not time_picker.is_visible(timeout=5000):
+        raise Exception("Time picker input not found")
+
     time_picker.click()
-
-    time_picker_container = page.locator(
-        f"xpath={config.selectors.schedule.time_picker_container}"
-    )
-    time_picker_container.wait_for(state="visible")
-
-    hour_options = page.locator(f"xpath={config.selectors.schedule.timepicker_hours}")
-    minute_options = page.locator(
-        f"xpath={config.selectors.schedule.timepicker_minutes}"
-    )
-
-    hour_to_click = hour_options.nth(hour)
-    minute_option_correct_index = int(minute / 5)
-    minute_to_click = minute_options.nth(minute_option_correct_index)
-
-    hour_to_click.scroll_into_view_if_needed()
     time.sleep(0.5)
-    hour_to_click.click()
 
-    minute_to_click.scroll_into_view_if_needed()
+    # Wait for the drum-roll container to appear
+    container_sel = (
+        "xpath=//div[contains(@class,'tiktok-timepicker-time-picker-container')"
+        " and not(contains(@class,'invisible'))]"
+    )
+    page.locator(container_sel).first.wait_for(state="visible", timeout=5000)
+
+    # --- Hour: use direct XPath text match (handles both "9" and "09") ---
+    hour_xpath = (
+        f"xpath=//span[contains(@class,'tiktok-timepicker-left')"
+        f" and (normalize-space(text())='{hour}'"
+        f" or normalize-space(text())='{hour:02d}')]"
+    )
+    hour_el = page.locator(hour_xpath).first
+    hour_el.scroll_into_view_if_needed()
     time.sleep(0.5)
-    minute_to_click.click()
+    hour_el.click()
+    time.sleep(0.3)
 
+    # --- Minute: use direct XPath text match (always zero-padded: "00", "05" …) ---
+    minute_xpath = (
+        f"xpath=//span[contains(@class,'tiktok-timepicker-right')"
+        f" and (normalize-space(text())='{minute:02d}'"
+        f" or normalize-space(text())='{minute}')]"
+    )
+    minute_el = page.locator(minute_xpath).first
+    minute_el.scroll_into_view_if_needed()
+    time.sleep(0.5)
+    minute_el.click()
+    time.sleep(0.3)
+
+    # Close the time picker
     time_picker.click()
     time.sleep(0.5)
 
@@ -733,18 +902,23 @@ def __time_picker(page: Page, hour: int, minute: int) -> None:
 
 
 def __verify_time_picked_is_correct(page: Page, hour: int, minute: int) -> None:
-    time_selected = page.locator(
-        f"xpath={config.selectors.schedule.time_picker_text}"
-    ).inner_text()
-    time_selected_hour = int(time_selected.split(":")[0])
-    time_selected_minute = int(time_selected.split(":")[1])
+    # Read back the time input value attribute (format: "HH:MM")
+    time_input = page.locator(
+        "xpath=//div[contains(@class,'scheduled-picker')]//input[not(contains(@value,'-'))]"
+    ).first
+    time_selected = time_input.get_attribute("value") or ""
+    try:
+        time_selected_hour = int(time_selected.split(":")[0])
+        time_selected_minute = int(time_selected.split(":")[1])
+    except Exception:
+        logger.debug(green(f"Could not verify time — raw value: {time_selected!r}"))
+        return
 
     if time_selected_hour == hour and time_selected_minute == minute:
         logger.debug(green("Time picked correctly"))
     else:
         msg = (
-            f"Something went wrong with the time picker, "
-            f"expected {hour:02d}:{minute:02d} "
+            f"Time picker mismatch: expected {hour:02d}:{minute:02d} "
             f"but got {time_selected_hour:02d}:{time_selected_minute:02d}"
         )
         raise Exception(msg)
@@ -781,11 +955,86 @@ def _post_video(page: Page) -> None:
     except Exception:
         pass
 
+
+def _post_video(page: Page) -> None:
+    """
+    Posts the video
+    """
+    logger.debug(green("Clicking the post button"))
+
+    post_btn = page.locator(f"xpath={config.selectors.upload.post}")
+    try:
+
+        def is_enabled():
+            return post_btn.get_attribute("data-disabled") == "false"
+
+        for _ in range(int(config.uploading_wait / 2)):
+            if is_enabled():
+                break
+            time.sleep(2)
+
+        post_btn.scroll_into_view_if_needed()
+        post_btn.click()
+
+    except Exception:
+        logger.debug(green("Trying to click on the button again (fallback)"))
+        page.evaluate('document.querySelector(".TUXButton--primary").click()')
+
+    try:
+        post_now = page.locator(f"xpath={config.selectors.upload.post_now}")
+        if post_now.is_visible(timeout=5000):
+            post_now.click()
+    except Exception:
+        pass
+
+    # Poll for success confirmation OR low-quality warning popup.
+    # If the popup appears, dismiss it with X and re-click Post.
     post_confirmation = page.locator(
         f"xpath={config.selectors.upload.post_confirmation}"
     )
-    post_confirmation.wait_for(state="attached", timeout=config.explicit_wait * 1000)
+    low_quality_close = page.locator(
+        "xpath=//div[contains(@class,'modal') or contains(@class,'dialog') or contains(@class,'popup')]"
+        "//button[@aria-label='Close' or contains(@class,'close') or contains(@class,'dismiss')]"
+        " | xpath=//*[@data-e2e='close-btn']"
+        " | xpath=//button[contains(@aria-label,'lose')]"
+    )
 
+    deadline = time.time() + config.explicit_wait
+    while time.time() < deadline:
+        # Success?
+        try:
+            if post_confirmation.is_visible(timeout=1000):
+                logger.debug(green("Video posted successfully"))
+                return
+        except Exception:
+            pass
+
+        # Low-quality popup blocking the post?
+        try:
+            if low_quality_close.first.is_visible(timeout=1000):
+                low_quality_close.first.click()
+                logger.debug(
+                    green(
+                        "Dismissed low-quality popup after Post click — retrying Post"
+                    )
+                )
+                time.sleep(0.5)
+                try:
+                    post_btn.click()
+                except Exception:
+                    try:
+                        page.evaluate(
+                            'document.querySelector(".TUXButton--primary").click()'
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        time.sleep(1)
+
+    # Final check
+    post_confirmation.wait_for(state="attached", timeout=5000)
     logger.debug(green("Video posted successfully"))
 
 
