@@ -69,6 +69,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class _NoCookieFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "cookie" not in record.getMessage().lower()
+
+
+# Show uploader DEBUG (upload progress) but suppress cookie noise.
+_ttu = logging.getLogger("tiktok_uploader")
+_ttu.setLevel(logging.DEBUG)
+for _h in logging.root.handlers:
+    _h.addFilter(_NoCookieFilter())
+
+
 # ---------------------------------------------------------------------------
 # Scheduling helpers
 # ---------------------------------------------------------------------------
